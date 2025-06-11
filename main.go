@@ -42,6 +42,7 @@ var (
 	bufferMutex  sync.Mutex
 	isRecording  bool = true
 	lastSpeechTs time.Time
+	speechActive bool
 )
 
 func initWhisper() {
@@ -130,6 +131,34 @@ func processAudioOld(in []float32) {
 	}
 }
 
+func processAudioSec(in []float32) {
+	bufferMutex.Lock()
+	defer bufferMutex.Unlock()
+
+	if !isRecording {
+		return
+	}
+
+	// Отладочный вывод уровня звука
+	rms := computeRMS(in)
+	fmt.Printf("\rRMS: %.5f (Threshold: %.5f)", rms, vadThreshold) // Курсор остаётся на строке
+
+	if rms > vadThreshold {
+		if !speechActive {
+			fmt.Println("\nSpeech detected!")
+			speechActive = true
+		}
+		lastSpeechTs = time.Now()
+		audioBuffer = append(audioBuffer, in...)
+	} else {
+		if speechActive && time.Since(lastSpeechTs) > time.Millisecond*silenceTimeout {
+			fmt.Println("\nSilence detected, processing...")
+			processBuffer()
+			speechActive = false
+		}
+	}
+}
+
 func processAudio(in []float32) {
 	bufferMutex.Lock()
 	defer bufferMutex.Unlock()
@@ -138,14 +167,32 @@ func processAudio(in []float32) {
 		return
 	}
 
-	// VAD - проверка наличия речи
-	if hasSpeech(in) {
+	// Отладочный вывод уровня звука
+	rms := computeRMS(in)
+	fmt.Printf("\rRMS: %.5f (Threshold: %.5f)", rms, vadThreshold) // Курсор остаётся на строке
+
+	if rms > vadThreshold {
+		if !speechActive {
+			fmt.Println("\nSpeech detected!")
+			speechActive = true
+		}
 		lastSpeechTs = time.Now()
 		audioBuffer = append(audioBuffer, in...)
-		processIncremental() // Потоковая обработка
-	} else if time.Since(lastSpeechTs) > time.Millisecond*silenceTimeout && len(audioBuffer) > 0 {
-		processBuffer() // Обработка при длительном молчании
+	} else {
+		if speechActive && time.Since(lastSpeechTs) > time.Millisecond*silenceTimeout {
+			fmt.Println("\nSilence detected, processing...")
+			processBuffer()
+			speechActive = false
+		}
 	}
+}
+
+func computeRMS(samples []float32) float64 {
+	var sum float64
+	for _, s := range samples {
+		sum += float64(s * s)
+	}
+	return math.Sqrt(sum / float64(len(samples)))
 }
 
 // VAD - простая реализация детектора речи
@@ -272,7 +319,7 @@ func handleHotkeys() {
 	b := make([]byte, 1)
 	for {
 		os.Stdin.Read(b)
-		fmt.Println(b[0])
+		//fmt.Println(b[0])
 		switch b[0] {
 		case ' ': // Пауза/продолжение
 			bufferMutex.Lock()
