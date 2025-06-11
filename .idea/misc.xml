@@ -10,6 +10,10 @@
           <option name="importPath" value="fmt" />
           <option name="name" value="Printf" />
         </PrintfFuncDescriptorState>
+        <PrintfFuncDescriptorState>
+          <option name="importPath" value="log" />
+          <option name="name" value="Printf" />
+        </PrintfFuncDescriptorState>
       </set>
     </option>
     <option name="excludedNames">
