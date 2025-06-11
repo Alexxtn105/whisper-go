@@ -9,11 +9,12 @@ package main
 import "C"
 
 // #cgo LDFLAGS: -L${SRCDIR}/lib -lwhisper -lm
-
+// Error:  input is too short - 60 ms < 100 ms. consider padding the input audio with silence
 import (
 	"fmt"
+	"github.com/eiannone/keyboard"
 	"github.com/gordonklaus/portaudio"
-	_ "github.com/mitchellh/go-ps"
+	//_ "github.com/mitchellh/go-ps"
 	"golang.org/x/term"
 	"log"
 	"math"
@@ -26,10 +27,9 @@ import (
 )
 
 const (
-	sampleRate  = 16000
-	bufferSize  = 1024
-	numChannels = 1
-	//modelPath      = "models/ggml-small.bin" // Путь к модели Whisper
+	sampleRate     = 16000
+	bufferSize     = 1024
+	numChannels    = 1
 	modelPath      = "models/ggml-base.bin" // Путь к модели Whisper
 	vadThreshold   = 0.01                   // Порог VAD (0-1)
 	minSpeechMs    = 500                    // Минимальная длительность речи (мс)
@@ -101,22 +101,66 @@ func main() {
 		}
 	}(stream)
 
-	//fmt.Println("Recording... Press Ctrl+C to stop.")
-	//select {}
+	// Инициализация клавиатуры
+	if err := keyboard.Open(); err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		err := keyboard.Close()
+		if err != nil {
+			log.Fatalf("Failed close keyboard: %v", err)
+		}
+	}()
 
-	// Канал для обработки сигналов
+	fmt.Println("Recording started. Controls:")
+	fmt.Println("- Space: Pause/Resume recording")
+	fmt.Println("- C: Clear buffer")
+	fmt.Println("- Q: Quit")
+
+	// Канал для сигналов завершения
+	done := make(chan struct{})
+	defer close(done)
+
+	// Горутина для обработки клавиш
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				char, key, err := keyboard.GetKey()
+				if err != nil {
+					continue
+				}
+
+				switch {
+				case key == keyboard.KeySpace:
+					bufferMutex.Lock()
+					isRecording = !isRecording
+					status := "RESUMED"
+					if !isRecording {
+						status = "PAUSED"
+					}
+					fmt.Printf("\nRecording %s\n", status)
+					bufferMutex.Unlock()
+
+				case char == 'c' || char == 'C':
+					bufferMutex.Lock()
+					audioBuffer = nil
+					fmt.Println("\nBuffer cleared")
+					bufferMutex.Unlock()
+
+				case char == 'q' || char == 'Q':
+					fmt.Println("\nQuitting...")
+					os.Exit(0)
+				}
+			}
+		}
+	}()
+
+	// Ожидание Ctrl+C
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Горутина для обработки горячих клавиш
-	go handleHotkeys()
-
-	fmt.Println("Recording started. Press:")
-	fmt.Println("- Space: Pause/Resume")
-	fmt.Println("- Q: Quit")
-	fmt.Println("- C: Clear buffer")
-
-	// Ожидаем сигнал завершения
 	<-sigChan
 	fmt.Println("\nShutting down...")
 }
@@ -314,11 +358,16 @@ func handleHotkeys() {
 	if err != nil {
 		return
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer func(fd int, oldState *term.State) {
+		err := term.Restore(fd, oldState)
+		if err != nil {
+			log.Fatalf("Failed to restore term: %v", err)
+		}
+	}(int(os.Stdin.Fd()), oldState)
 
 	b := make([]byte, 1)
 	for {
-		os.Stdin.Read(b)
+		_, _ = os.Stdin.Read(b)
 		//fmt.Println(b[0])
 		switch b[0] {
 		case ' ': // Пауза/продолжение
@@ -333,7 +382,11 @@ func handleHotkeys() {
 		case 'q', 'Q': // Выход
 			pid := os.Getpid()
 			process, _ := os.FindProcess(pid)
-			process.Signal(syscall.SIGINT)
+			err := process.Signal(syscall.SIGINT)
+			if err != nil {
+				log.Fatalf("Failed to process quit: %v", err)
+				return
+			}
 			return
 		case 'c', 'C': // Очистка буфера
 			bufferMutex.Lock()
