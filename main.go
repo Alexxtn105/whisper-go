@@ -29,26 +29,23 @@ const (
 	numChannels       = 1
 	modelPath         = "models/ggml-base.bin" // Путь к модели Whisper
 	vadThreshold      = 0.01                   // Порог VAD (0-1)
-	minSpeechMs       = 500                    // Минимальная длительность речи (мс)
 	silenceTimeout    = 2000                   // Таймаут молчания (мс)
 	processingTimeout = 10 * time.Second
 	maxBufferSize     = sampleRate * 30 // Максимальный размер буфера 30 секунд
 )
 
 var (
-	ctx         *C.struct_whisper_context
-	audioBuffer []float32
-	bufferMutex sync.Mutex
-	//isRecording   atomic.Bool
-	keyboardMutex sync.Mutex
-	isRecording   = true
-	lastSpeechTs  time.Time
-	speechActive  bool
-	processing    atomic.Bool
+	ctx          *C.struct_whisper_context
+	audioBuffer  []float32
+	bufferMutex  sync.Mutex
+	isRecording  atomic.Bool
+	lastSpeechTs time.Time
+	speechActive bool
+	processing   atomic.Bool
 )
 
 func init() {
-	//	isRecording.Store(true)
+	isRecording.Store(true)
 }
 
 func initWhisper() {
@@ -67,11 +64,12 @@ func initWhisper() {
 }
 
 func main() {
-	// Инициализируем Whisper
+	//region Инициализируем Whisper
 	initWhisper()
 	defer C.whisper_free(ctx)
+	//endregion
 
-	// Инициализируем PortAudio
+	//region Инициализируем PortAudio
 	err := portaudio.Initialize()
 	if err != nil {
 		log.Fatalf("Failed to initialize PortAudio: %v", err)
@@ -82,7 +80,6 @@ func main() {
 			log.Fatalf("Failed to terminate PortAudio: %v", err)
 		}
 	}()
-
 	// Создаем поток для захвата аудио
 	stream, err := portaudio.OpenDefaultStream(numChannels, 0, sampleRate, bufferSize, processAudio)
 	if err != nil {
@@ -94,8 +91,9 @@ func main() {
 			log.Fatalf("Failed to close audio stream: %v", err)
 		}
 	}(stream)
+	//endregion
 
-	// Начинаем захват аудио
+	//region Начинаем захват аудио
 	err = stream.Start()
 	if err != nil {
 		log.Fatalf("Failed to start audio stream: %v", err)
@@ -106,8 +104,9 @@ func main() {
 			log.Fatalf("Failed to stop audio stream: %v", err)
 		}
 	}(stream)
+	//endregion
 
-	// Инициализация клавиатуры
+	//region Инициализация клавиатуры
 	if err := keyboard.Open(); err != nil {
 		log.Fatal(err)
 	}
@@ -117,6 +116,7 @@ func main() {
 			log.Fatalf("Failed close keyboard: %v", err)
 		}
 	}()
+	//endregion
 
 	fmt.Println("Recording started. Controls:")
 	fmt.Println("- Space: Pause/Resume recording")
@@ -142,9 +142,11 @@ func main() {
 				switch {
 				case key == keyboard.KeySpace:
 					bufferMutex.Lock()
-					isRecording = !isRecording
+					old := isRecording.Swap(!isRecording.Load())
+					_ = old
+					//isRecording = !isRecording
 					status := "RESUMED"
-					if !isRecording {
+					if !isRecording.Load() {
 						status = "PAUSED"
 					}
 					fmt.Printf("\nRecording %s\n", status)
@@ -172,33 +174,44 @@ func main() {
 }
 
 func processAudio(in []float32) {
-	bufferMutex.Lock()
-	defer bufferMutex.Unlock()
-
-	if !isRecording {
+	if !isRecording.Load() {
 		return
 	}
 
-	// Отладочный вывод уровня звука
-	rms := computeRMS(in)
-	fmt.Printf("\rRMS: %.5f (Threshold: %.5f)", rms, vadThreshold) // Курсор остаётся на строке
+	// Блокировка для записи
+	bufferMutex.Lock()
+	defer bufferMutex.Unlock()
 
+	// Добавляем новые сэмплы с проверкой переполнения
+	audioBuffer = append(audioBuffer, in...)
+	if len(audioBuffer) > maxBufferSize {
+		audioBuffer = audioBuffer[len(audioBuffer)-maxBufferSize:]
+	}
+
+	// Анализ только последних 300 мс для VAD
+	vadWindow := 300 * sampleRate / 1000
+	if len(audioBuffer) < vadWindow {
+		return
+	}
+
+	window := audioBuffer[len(audioBuffer)-vadWindow:]
+	rms := computeRMS(window)
+
+	// Обновление статуса речи
 	if rms > vadThreshold {
-		if !speechActive {
-			fmt.Println("\nSpeech detected!")
-			speechActive = true
-		}
 		lastSpeechTs = time.Now()
-		audioBuffer = append(audioBuffer, in...)
-		if len(audioBuffer) > maxBufferSize {
-			audioBuffer = audioBuffer[len(audioBuffer)-maxBufferSize:]
+		if !speechActive {
+			speechActive = true
+			fmt.Println("\nSpeech detected, recording...")
 		}
-	} else {
-		if speechActive && time.Since(lastSpeechTs) > time.Millisecond*silenceTimeout {
-			fmt.Println("\nSilence detected, processing...")
-			processBuffer()
-			speechActive = false
-		}
+		return
+	}
+
+	// Обработка окончания речи
+	if speechActive && time.Since(lastSpeechTs) > silenceTimeout*time.Millisecond {
+		speechActive = false
+		fmt.Println("\nSilence detected, starting processing...")
+		go processBuffer() // Асинхронная обработка
 	}
 }
 
@@ -212,34 +225,80 @@ func computeRMS(samples []float32) float64 {
 
 // processBuffer Полная обработка буфера
 func processBuffer() {
-	defer func() {
-		if processing.Load() {
-			processing.Store(false)
+	// Проверяем, не обрабатывается ли уже другой фрагмент
+	if !processing.CompareAndSwap(false, true) {
+		log.Println("Previous processing still in progress, skipping")
+		return
+	}
+	defer processing.Store(false)
+
+	// Быстрое копирование буфера с минимальной блокировкой
+	bufferMutex.Lock()
+	if len(audioBuffer) == 0 {
+		bufferMutex.Unlock()
+		return
+	}
+
+	processingBuffer := make([]float32, len(audioBuffer))
+	copy(processingBuffer, audioBuffer)
+	audioBuffer = nil
+	bufferMutex.Unlock()
+
+	// Канал для результатов обработки
+	resultChan := make(chan struct{}, 1)
+	defer close(resultChan)
+
+	// Обработка в отдельной горутине
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Whisper processing panic: %v", r)
+			}
+			resultChan <- struct{}{}
+		}()
+
+		params := C.whisper_full_default_params(C.WHISPER_SAMPLING_GREEDY)
+		params.language = C.CString("ru")
+		defer C.free(unsafe.Pointer(params.language))
+		params.translate = false
+		params.no_context = true
+		params.single_segment = true
+
+		log.Printf("Starting processing of %.2f seconds audio", float64(len(processingBuffer))/sampleRate)
+		start := time.Now()
+
+		// Важная проверка перед вызовом C-кода
+		if len(processingBuffer) == 0 {
+			log.Println("Empty buffer passed to Whisper")
+			return
 		}
+
+		ret := C.whisper_full(
+			ctx,
+			params,
+			(*C.float)(&processingBuffer[0]),
+			C.int(len(processingBuffer)),
+		)
+		if ret != 0 {
+			log.Printf("Whisper processing failed with code %d", ret)
+			return
+		}
+
+		nSegments := C.whisper_full_n_segments(ctx)
+		for i := 0; i < int(nSegments); i++ {
+			text := C.whisper_full_get_segment_text(ctx, C.int(i))
+			fmt.Printf("\n[%.2fs] %s\n", float64(C.whisper_full_get_segment_t1(ctx, C.int(i)))/100.0,
+				C.GoString(text))
+		}
+		log.Printf("Processing completed in %v", time.Since(start))
 	}()
 
-	if len(audioBuffer) == 0 {
-		return
+	// Таймаут для обработки
+	select {
+	case <-resultChan:
+		log.Println("Processing finished successfully")
+	case <-time.After(processingTimeout):
+		log.Println("Processing timeout reached, terminating")
+		// Важно: НЕ прерываем C-код, просто продолжаем работу
 	}
-
-	params := C.whisper_full_default_params(C.WHISPER_SAMPLING_GREEDY)
-	params.language = C.CString("ru")
-	defer C.free(unsafe.Pointer(params.language))
-	params.translate = false
-	params.print_progress = true
-	params.print_realtime = true
-
-	result := C.whisper_full(ctx, params, (*C.float)(&audioBuffer[0]), C.int(len(audioBuffer)))
-	if result != 0 {
-		log.Printf("Ошибка обработки: %d", result)
-		return
-	}
-
-	n_segments := C.whisper_full_n_segments(ctx)
-	for i := 0; i < int(n_segments); i++ {
-		text := C.whisper_full_get_segment_text(ctx, C.int(i))
-		fmt.Printf("\n%s\n", C.GoString(text)) // \n для новой строки
-	}
-
-	audioBuffer = nil
 }
