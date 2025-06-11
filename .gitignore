@@ -1,0 +1,4 @@
+models/ggml-base.bin
+models/ggml-medium.bin
+models/ggml-small.bin
+whisper-go.exe
